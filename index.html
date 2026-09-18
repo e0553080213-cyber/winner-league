@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>ליגת ווינר סל</title>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Heebo:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <style>
   :root{
     --court-bg: #0d1420;
@@ -604,93 +606,95 @@
     showView('poll');
   }
 
-  // ================= DB / POLL =================
-  var dbNS = null, userNS = null, myId = null;
-  var voteCounts = {}; // teamId -> count
+  // ================= DB / POLL (Firebase) =================
+  // Paste your own Firebase project's web config here to turn on shared
+  // poll/chat/tournament across everyone who opens this page. Leave the
+  // apiKey empty to run fully local (each device sees only itself).
+  var FIREBASE_CONFIG = {
+    apiKey: "AIzaSyC3t2OikckNgLDZUHPphMfHWhKxAa1WsZY",
+    authDomain: "winner-league-26bf9.firebaseapp.com",
+    databaseURL: "https://winner-league-26bf9-default-rtdb.firebaseio.com",
+    projectId: "winner-league-26bf9"
+  };
+
+  var fdb = null;
   var dbLive = false;
+  var voteCounts = {}; // teamId -> count
   var chatLive = false;
   var lbLive = false;
-  var canEdit = false;
-  var isOwnerViewer = false;
+  var canEdit = false;       // unused outside Claude, kept for compatibility
+  var isOwnerViewer = false; // unused outside Claude, kept for compatibility
   var season = {id: 0, ts: 0};
   var leaderboardEntries = [];
 
-  async function initCapabilities(){
+  // a stable per-device id, since there is no sign-in here
+  var myId = localStorage.getItem('wl_device_id');
+  if(!myId){
+    myId = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2,10);
+    localStorage.setItem('wl_device_id', myId);
+  }
+
+  function initCapabilities(){
+    if(!FIREBASE_CONFIG.apiKey){
+      dbLive = false;
+      voteCounts = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
+      renderPollBars(); renderPollSummary();
+      renderChat(null);
+      renderTournament();
+      refreshAdminUI();
+      return;
+    }
     try{
-      userNS = await claude.use("user");
-      dbNS = await claude.use("db");
-    }catch(e){ dbNS = null; userNS = null; }
-
-    if(userNS){
-      try{ myId = await userNS.id(); }catch(e){ myId = null; }
-    }
-
-    if(dbNS && myId){
+      firebase.initializeApp(FIREBASE_CONFIG);
+      fdb = firebase.database();
       dbLive = true;
-      try{
-        dbNS.collection("votes").onSnapshot(function(snap){
-          var counts = {};
-          snap.docs.forEach(function(d){
-            var data = d.data();
-            if(data && data.team){ counts[data.team] = (counts[data.team]||0)+1; }
-          });
-          voteCounts = counts;
-          renderPollBars();
-          renderPollSummary();
-        }, function(err){ /* degrade quietly */ });
-      }catch(e){ dbLive = false; }
-    }
+    }catch(e){ dbLive = false; }
+
     if(!dbLive){
-      // local-only fallback: seed from any locally stored vote
-      var local = localStorage.getItem('wl_local_votes');
-      voteCounts = local ? JSON.parse(local) : {};
+      voteCounts = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
+      renderPollBars(); renderPollSummary();
+      renderChat(null);
+      renderTournament();
+      refreshAdminUI();
+      return;
+    }
+
+    // votes / poll — everyone reads and writes only their own device id
+    fdb.ref('votes').on('value', function(snap){
+      var counts = {};
+      snap.forEach(function(child){
+        var v = child.val();
+        if(v && v.team){ counts[v.team] = (counts[v.team]||0)+1; }
+      });
+      voteCounts = counts;
       renderPollBars();
       renderPollSummary();
-    }
-    // if a team was already chosen before capabilities were ready, make sure vote is recorded
+    }, function(){ /* degrade quietly */ });
     if(state.myTeam){ castVote(state.myTeam, true); }
 
-    // anonymous chat — no identity needed to read or write it
-    if(dbNS){
-      try{
-        dbNS.collection("chat").orderBy("ts","desc").limit(50).onSnapshot(function(snap){
-          chatLive = true;
-          var msgs = snap.docs.map(function(d){ return d.data(); }).filter(Boolean);
-          msgs.reverse();
-          renderChat(msgs);
-        }, function(err){ chatLive = false; renderChat(null); });
-      }catch(e){ chatLive = false; renderChat(null); }
-    } else {
-      renderChat(null);
-    }
+    // anonymous chat
+    fdb.ref('chat').orderByChild('ts').limitToLast(50).on('value', function(snap){
+      chatLive = true;
+      var msgs = [];
+      snap.forEach(function(child){ msgs.push(child.val()); });
+      renderChat(msgs);
+    }, function(){ chatLive = false; renderChat(null); });
 
-    // tournament: a shared "season" marker lets a reset zero everyone's
-    // shown tally without one viewer being able to overwrite another's doc
-    if(dbNS){
-      try{
-        dbNS.doc("meta/season").onSnapshot(function(snap){
-          var data = snap.exists ? snap.data() : null;
-          applySeason(data && data.id ? {id:data.id, ts:data.ts||0} : {id:0, ts:0});
-        }, function(err){ /* keep season 0 */ });
-      }catch(e){ /* ignore */ }
+    // tournament season marker
+    fdb.ref('meta/season').on('value', function(snap){
+      var data = snap.val();
+      applySeason(data && data.id ? {id:data.id, ts:data.ts||0} : {id:0, ts:0});
+    }, function(){ /* keep season 0 */ });
 
-      try{
-        dbNS.collection("leaderboard").onSnapshot(function(snap){
-          lbLive = true;
-          leaderboardEntries = snap.docs.map(function(d){ return d.data(); }).filter(Boolean);
-          renderTournament();
-        }, function(err){ lbLive = false; renderTournament(); });
-      }catch(e){ lbLive = false; renderTournament(); }
-    } else {
+    // leaderboard
+    fdb.ref('leaderboard').on('value', function(snap){
+      lbLive = true;
+      var entries = [];
+      snap.forEach(function(child){ entries.push(child.val()); });
+      leaderboardEntries = entries;
       renderTournament();
-    }
+    }, function(){ lbLive = false; renderTournament(); });
 
-    if(userNS){
-      try{ canEdit = !!(await userNS.canEdit()); }catch(e){ canEdit = false; }
-      try{ isOwnerViewer = !!(await userNS.isOwner()); }catch(e){ isOwnerViewer = false; }
-      refreshSelectLock();
-      updateMyLeaderboardDoc(); // re-send now that we know the owner flag
-    }
     refreshAdminUI();
   }
 
@@ -698,8 +702,6 @@
     var seenId = localStorage.getItem('wl_season_seen');
     var newId = String(newSeason.id);
     if(seenId !== newId){
-      // a new tournament started (or this is the first sync with an
-      // already-running one) — zero out this device's tally
       state.score = 0; state.attempts = 0;
       localStorage.setItem('wl_score','0');
       localStorage.setItem('wl_attempts','0');
@@ -713,13 +715,13 @@
 
   function updateMyLeaderboardDoc(){
     if(dbLive && myId && state.myTeam){
-      dbNS.doc('leaderboard/'+myId).set({
+      fdb.ref('leaderboard/'+myId).set({
         team: state.myTeam,
         name: state.displayName || '',
         made: state.score,
         attempts: state.attempts,
         seasonId: season.id,
-        owner: (isOwnerViewer || isNameAdmin),
+        owner: isNameAdmin,
         ts: Date.now()
       }).catch(function(){});
     }
@@ -772,13 +774,13 @@
   }
 
   function startNewTournament(btn, andShowView){
-    if(!dbNS){
+    if(!dbLive){
       var prevText = btn.textContent;
       btn.textContent = 'אין חיבור לשרת';
       setTimeout(function(){ btn.textContent = prevText; }, 1800);
       return;
     }
-    if(!canEdit && !isOwnerViewer && !isNameAdmin){
+    if(!isNameAdmin){
       var prevText2 = btn.textContent;
       btn.textContent = 'אין הרשאה';
       setTimeout(function(){ btn.textContent = prevText2; }, 1800);
@@ -795,7 +797,9 @@
     var original = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'מתחיל…';
-    dbNS.doc('meta/season').set({id: Date.now(), ts: Date.now()}).then(function(){
+    // "key" must match the Realtime Database rule so a random visitor
+    // can't call this from the browser console without the admin name
+    fdb.ref('meta/season').set({id: Date.now(), ts: Date.now(), key: ADMIN_NAME}).then(function(){
       btn.textContent = 'טורניר חדש התחיל! 🏆';
       if(andShowView){ showView('tournament'); }
     }).catch(function(){
@@ -831,7 +835,7 @@
 
   function castVote(teamId, silent){
     if(dbLive && myId){
-      dbNS.collection("votes").doc(myId).set({team: teamId, ts: Date.now()}).catch(function(){});
+      fdb.ref('votes/'+myId).set({team: teamId, ts: Date.now()}).catch(function(){});
     } else {
       var local = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
       var prev = localStorage.getItem('wl_local_prev_vote');
@@ -926,14 +930,13 @@
       : '';
   }
 
-  async function sendChatMessage(){
+  function sendChatMessage(){
     var input = document.getElementById('chatInput');
     var text = input.value.trim();
     if(!text) return;
     input.value = '';
-    if(dbNS){
-      try{ await dbNS.collection('chat').add({text:text, ts:Date.now()}); }
-      catch(e){ /* ignore */ }
+    if(dbLive){
+      fdb.ref('chat').push({text:text, ts:Date.now()}).catch(function(){});
     }
   }
   document.getElementById('chatSend').addEventListener('click', sendChatMessage);
@@ -941,8 +944,1295 @@
     if(e.key==='Enter'){ e.preventDefault(); sendChatMessage(); }
   });
 
-  if(typeof claude !== 'undefined'){ initCapabilities(); }
-  else { renderPollBars(); renderPollSummary(); renderChat(null); renderTournament(); }
+  initCapabilities();
+
+  // ================= GAME =================
+  var canvas = document.getElementById('court');
+  var ctx = canvas.getContext('2d');
+  var CW = 360, CH = 560;
+  var scale = 1;
+
+  function resizeCanvas(){
+    var wrap = canvas.parentElement;
+    var w = wrap.clientWidth;
+    scale = w / CW;
+    canvas.style.height = (CH*scale)+'px';
+  }
+  window.addEventListener('resize', resizeCanvas);
+
+  // hoop geometry (logical coords)
+  var hoop = { x: CW/2, y: 96, rimW: 82, boardW: 120, boardH: 70, boardY: 40 };
+  var ball = { x: CW/2, y: CH-70, r: 20, vx:0, vy:0, moving:false };
+  var startBall = { x: CW/2, y: CH-70 };
+  var trail = [];
+  var particles = [];
+  var scored = false;
+  var netSwing = 0;
+  var dragging = false;
+  var dragStart = null;   // ball's visual anchor point (for the pull animation)
+  var fingerStart = null; // raw touch/mouse down point
+  var fingerLast = null;  // most recent raw touch/mouse point
+
+  function teamColor(){
+    return state.myTeam ? teamById[state.myTeam].color : '#e8590c';
+  }
+
+  function resetBall(){
+    ball.x = startBall.x; ball.y = startBall.y;
+    ball.vx = 0; ball.vy = 0; ball.moving = false;
+    scored = false;
+    trail = [];
+  }
+
+  function drawCourt(){
+    // floor gradient
+    var g = ctx.createLinearGradient(0,0,0,CH);
+    g.addColorStop(0, '#0d1420');
+    g.addColorStop(1, '#1a2436');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,CW,CH);
+
+    // wood floor band at bottom
+    var fg = ctx.createLinearGradient(0, CH-180, 0, CH);
+    fg.addColorStop(0, 'rgba(201,134,63,0.10)');
+    fg.addColorStop(1, 'rgba(201,134,63,0.22)');
+    ctx.fillStyle = fg;
+    ctx.fillRect(0, CH-180, CW, 180);
+    ctx.strokeStyle = 'rgba(242,237,226,0.15)';
+    ctx.lineWidth = 1;
+    for(var i=0;i<8;i++){
+      ctx.beginPath();
+      ctx.moveTo(0, CH-160+i*22);
+      ctx.lineTo(CW, CH-160+i*22);
+      ctx.stroke();
+    }
+
+    // key / paint
+    ctx.strokeStyle = 'rgba(242,237,226,0.35)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(CW/2-55, hoop.boardY+hoop.boardH-4, 110, 300);
+    ctx.beginPath();
+    ctx.arc(CW/2, hoop.boardY+hoop.boardH+296, 55, Math.PI, 2*Math.PI);
+    ctx.stroke();
+
+    // backboard
+    ctx.fillStyle = 'rgba(242,237,226,0.9)';
+    ctx.fillRect(hoop.x-hoop.boardW/2, hoop.boardY, hoop.boardW, hoop.boardH);
+    ctx.strokeStyle = 'rgba(13,20,32,0.6)';
+    ctx.strokeRect(hoop.x-hoop.boardW/2, hoop.boardY, hoop.boardW, hoop.boardH);
+    ctx.strokeStyle = teamColor();
+    ctx.lineWidth = 3;
+    ctx.strokeRect(hoop.x-24, hoop.boardY+hoop.boardH-30, 48, 26);
+
+    // rim
+    ctx.strokeStyle = teamColor();
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.ellipse(hoop.x, hoop.y, hoop.rimW/2, 7, 0, 0, Math.PI*2);
+    ctx.stroke();
+
+    // net
+    ctx.strokeStyle = 'rgba(242,237,226,0.6)';
+    ctx.lineWidth = 1;
+    var netTop = hoop.y+2, netBot = hoop.y+34;
+    var swing = netSwing * Math.sin(Date.now()/65) * 9;
+    for(var n=-1;n<=1;n++){
+      ctx.beginPath();
+      ctx.moveTo(hoop.x+n*hoop.rimW/2, netTop);
+      ctx.lineTo(hoop.x+n*hoop.rimW/4+swing, netBot);
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(hoop.x-hoop.rimW/4+swing*0.6, netTop+10);
+    ctx.lineTo(hoop.x+hoop.rimW/4+swing*0.6, netTop+10);
+    ctx.stroke();
+  }
+
+  function drawBall(){
+    // trail
+    for(var i=0;i<trail.length;i++){
+      var p = trail[i];
+      ctx.globalAlpha = (i/trail.length)*0.35;
+      ctx.fillStyle = teamColor();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, ball.r*0.6, 0, Math.PI*2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    var g = ctx.createRadialGradient(ball.x-6, ball.y-8, 3, ball.x, ball.y, ball.r);
+    g.addColorStop(0,'#ff9d5c');
+    g.addColorStop(1,'#c2500e');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(ball.x-ball.r, ball.y); ctx.lineTo(ball.x+ball.r, ball.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ball.x, ball.y-ball.r); ctx.lineTo(ball.x, ball.y+ball.r); ctx.stroke();
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r*0.6, 0, Math.PI*2); ctx.stroke();
+  }
+
+  function drawParticles(){
+    particles.forEach(function(p){
+      ctx.globalAlpha = Math.max(p.life,0);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  function burst(x,y){
+    for(var i=0;i<16;i++){
+      var ang = Math.random()*Math.PI*2;
+      var spd = 1.5+Math.random()*3;
+      particles.push({x:x,y:y, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, r:2+Math.random()*2, life:1, color: teamColor()});
+    }
+  }
+
+  var GRAVITY = 0.72;
+
+  function collideRimPost(cx, cy){
+    var dx = ball.x-cx, dy = ball.y-cy;
+    var dist = Math.hypot(dx,dy);
+    var obstacleR = 4;
+    var minDist = ball.r + obstacleR;
+    if(dist < minDist && dist > 0.001){
+      var nx = dx/dist, ny = dy/dist;
+      var overlap = minDist-dist;
+      ball.x += nx*overlap;
+      ball.y += ny*overlap;
+      var vDotN = ball.vx*nx + ball.vy*ny;
+      ball.vx -= 1.15*vDotN*nx;
+      ball.vy -= 1.15*vDotN*ny;
+      ball.vx *= 0.9; ball.vy *= 0.9;
+    }
+  }
+
+  function step(){
+    ctx.clearRect(0,0,CW,CH);
+    if(netSwing>0.02){ netSwing *= 0.93; } else { netSwing = 0; }
+    drawCourt();
+
+    if(ball.moving){
+      trail.push({x:ball.x,y:ball.y});
+      if(trail.length>14) trail.shift();
+
+      ball.vy += GRAVITY;
+      ball.x += ball.vx;
+      ball.y += ball.vy;
+
+      // rim posts: the ball can clank off either side of the rim, and may
+      // still drop in afterward if it comes back down through the opening
+      collideRimPost(hoop.x-hoop.rimW/2, hoop.y);
+      collideRimPost(hoop.x+hoop.rimW/2, hoop.y);
+
+      // score check: crossing rim height, moving downward, within rim x-range, roughly center
+      if(!scored && ball.vy>0 && ball.y>=hoop.y-14 && ball.y<=hoop.y+20 &&
+         Math.abs(ball.x-hoop.x) < hoop.rimW/2-4){
+        scored = true;
+        registerScore();
+        burst(hoop.x, hoop.y+10);
+      }
+
+      // backboard collision — only the solid part of the board OUTSIDE the rim
+      // opening is solid; a ball aimed through the rim passes clean through.
+      // Bounce direction depends on which side the ball hit, never forced.
+      if(ball.y > hoop.boardY && ball.y - ball.r < hoop.boardY+hoop.boardH){
+        var offCenter = ball.x - hoop.x;
+        var absOff = Math.abs(offCenter);
+        if(absOff < hoop.boardW/2 + ball.r && absOff > hoop.rimW/2 - 4){
+          if(offCenter < 0){
+            ball.vx = -Math.abs(ball.vx)*0.5 - 0.6;
+            ball.x = hoop.x - hoop.rimW/2 - ball.r - 1;
+          } else {
+            ball.vx = Math.abs(ball.vx)*0.5 + 0.6;
+            ball.x = hoop.x + hoop.rimW/2 + ball.r + 1;
+          }
+        }
+      }
+
+      // side walls
+      if(ball.x-ball.r < 0){ ball.x = ball.r; ball.vx *= -0.5; }
+      if(ball.x+ball.r > CW){ ball.x = CW-ball.r; ball.vx *= -0.5; }
+
+      // out of bounds -> reset
+      if(ball.y - ball.r > CH+30 || ball.y < -80){
+        setTimeout(resetBall, scored?450:120);
+        ball.moving = false;
+      }
+    } else if(dragging && dragStart){
+      // ball follows finger while charging the shot (only near start)
+    }
+
+    drawParticles();
+    particles = particles.filter(function(p){
+      p.x+=p.vx; p.y+=p.vy; p.vy+=0.12; p.life-=0.035;
+      return p.life>0;
+    });
+
+    drawBall();
+    requestAnimationFrame(step);
+  }
+
+  function registerScore(){
+    state.score++;
+    localStorage.setItem('wl_score', state.score);
+    if(state.score>state.best){
+      state.best = state.score;
+      localStorage.setItem('wl_best', state.best);
+    }
+    updateStats();
+    flashMessage('בפנים! 🔥');
+    netSwing = 1;
+    updateMyLeaderboardDoc();
+  }
+
+  function registerAttempt(){
+    state.attempts++;
+    localStorage.setItem('wl_attempts', state.attempts);
+    updateStats();
+    updateMyLeaderboardDoc();
+  }
+
+  function updateStats(){
+    document.getElementById('statScore').textContent = state.score;
+    document.getElementById('statAttempts').textContent = state.attempts;
+    document.getElementById('statBest').textContent = state.best;
+  }
+  updateStats();
+
+  function flashMessage(text){
+    var el = document.getElementById('flashMsg');
+    el.textContent = text;
+    el.classList.remove('show');
+    void el.offsetWidth;
+    el.classList.add('show');
+  }
+
+  // ---------- pointer handling (drag to shoot) ----------
+  function getLogicalPos(evt){
+    var rect = canvas.getBoundingClientRect();
+    var clientX = evt.touches ? evt.touches[0].clientX : evt.clientX;
+    var clientY = evt.touches ? evt.touches[0].clientY : evt.clientY;
+    return {
+      x: (clientX-rect.left) / scale,
+      y: (clientY-rect.top) / scale
+    };
+  }
+
+  function onDown(evt){
+    if(ball.moving) return;
+    var p = getLogicalPos(evt);
+    var d = Math.hypot(p.x-ball.x, p.y-ball.y);
+    if(d < ball.r*2.6){
+      dragging = true;
+      dragStart = {x: ball.x, y: ball.y};
+      fingerStart = {x:p.x, y:p.y};
+      fingerLast = {x:p.x, y:p.y};
+      evt.preventDefault();
+    }
+  }
+  function onMove(evt){
+    if(!dragging) return;
+    var p = getLogicalPos(evt);
+    fingerLast = {x:p.x, y:p.y};
+    // ball visually follows the finger, clamped so it doesn't fly off while charging
+    var dx = p.x-dragStart.x, dy = p.y-dragStart.y;
+    var dist = Math.hypot(dx,dy);
+    var maxPull = 70;
+    if(dist>maxPull){ dx = dx/dist*maxPull; dy = dy/dist*maxPull; }
+    ball.x = dragStart.x + dx;
+    ball.y = dragStart.y + dy;
+    evt.preventDefault();
+  }
+  function onUp(evt){
+    if(!dragging) return;
+    dragging = false;
+    if(!fingerStart || !fingerLast){ ball.x = startBall.x; ball.y = startBall.y; return; }
+    // direction + power come from the total finger travel (start -> release),
+    // not from noisy per-event sampling — this is what makes the throw match your swipe.
+    var dx = fingerLast.x - fingerStart.x;
+    var dy = fingerLast.y - fingerStart.y;
+    var dist = Math.hypot(dx,dy);
+    if(dist < 18 || dy > -8){
+      // too short, or not swiped upward enough — snap back, no attempt
+      ball.x = startBall.x; ball.y = startBall.y;
+      return;
+    }
+    var ux = dx/dist, uy = dy/dist;
+    var speed = Math.min(27, Math.max(10, dist*0.13));
+    ball.vx = ux*speed;
+    ball.vy = uy*speed;
+    ball.moving = true;
+    registerAttempt();
+  }
+
+  canvas.addEventListener('mousedown', onDown);
+  window.addEventListener('mousemove', onMove);
+  window.addEventListener('mouseup', onUp);
+  canvas.addEventListener('touchstart', onDown, {passive:false});
+  canvas.addEventListener('touchmove', onMove, {passive:false});
+  canvas.addEventListener('touchend', onUp, {passive:false});
+
+  resizeCanvas();
+  requestAnimationFrame(step);
+
+  if(state.myTeam){ showView('game'); } // returning visitor, canvas is ready now
+
+})();
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ליגת ווינר סל</title>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Heebo:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
+<style>
+  :root{
+    --court-bg: #0d1420;
+    --court-bg-2: #141d2c;
+    --wood: #c9863f;
+    --wood-dim: #8a5c2b;
+    --line: #f2ede2;
+    --ball: #e8590c;
+    --ball-dark: #b5430a;
+    --ink: #f2ede2;
+    --ink-dim: #a7b0c0;
+    --card-bg: #16202f;
+    --card-border: #26344a;
+    --accent: #e8590c;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --court-bg: #0d1420;
+      --court-bg-2: #141d2c;
+      --card-bg: #16202f;
+      --card-border: #26344a;
+      --ink: #f2ede2;
+      --ink-dim: #a7b0c0;
+    }
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color: transparent;}
+  html,body{margin:0;padding:0;}
+  body{
+    background: radial-gradient(ellipse at top, var(--court-bg-2), var(--court-bg) 65%);
+    color: var(--ink);
+    font-family: 'Heebo', system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+    padding-bottom: 90px;
+  }
+  h1,h2,h3, .display{
+    font-family: 'Oswald', 'Heebo', system-ui, sans-serif;
+    letter-spacing: 0.5px;
+  }
+  .wrap{
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 18px 16px 8px;
+  }
+  header.top{
+    display:flex;
+    align-items:center;
+    justify-content: space-between;
+    padding: 6px 4px 16px;
+  }
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  .brand-ball{
+    width:34px;height:34px;border-radius:50%;
+    background: radial-gradient(circle at 32% 28%, #ff8a3d, var(--ball) 55%, var(--ball-dark) 100%);
+    position:relative;
+    flex-shrink:0;
+  }
+  .brand-ball::before,.brand-ball::after{
+    content:"";position:absolute;inset:0;border-radius:50%;
+    border-left:1.5px solid rgba(0,0,0,.35);
+    border-right:1.5px solid rgba(0,0,0,.35);
+  }
+  .brand-ball::after{
+    border:none;
+    border-top:1.5px solid rgba(0,0,0,.35);
+    border-bottom:1.5px solid rgba(0,0,0,.35);
+    border-radius:50%;
+  }
+  .brand h1{font-size:19px; margin:0; font-weight:700; line-height:1.1;}
+  .brand span{display:block; font-size:11px; color:var(--ink-dim); font-weight:400; letter-spacing:0.4px;}
+  .team-chip{
+    display:flex; align-items:center; gap:6px;
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    padding: 5px 10px 5px 6px;
+    border-radius: 999px;
+    font-size:12px;
+    cursor:pointer;
+  }
+  .team-chip .dot{width:16px;height:16px;border-radius:50%;flex-shrink:0;}
+
+  /* ---------- views ---------- */
+  .view{display:none;}
+  .view.active{display:block; animation: fadein .35s ease;}
+  @keyframes fadein{from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);}}
+
+  /* team select */
+  .lede{margin: 4px 0 18px;}
+  .lede h2{font-size:22px; margin:0 0 4px; font-weight:700;}
+  .lede p{margin:0; color:var(--ink-dim); font-size:14px; line-height:1.5;}
+  .team-grid{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .header-right{
+    display:flex; align-items:center; gap:8px;
+  }
+  .start-tournament-btn{
+    background: var(--accent);
+    color:#171414;
+    border:none;
+    border-radius: 999px;
+    padding: 7px 14px;
+    font-family:'Heebo',sans-serif;
+    font-weight:700;
+    font-size:12px;
+    cursor:pointer;
+    white-space:nowrap;
+  }
+  .name-row{
+    display:flex;
+    gap:8px;
+    margin-bottom: 12px;
+  }
+  .name-input{
+    display:block;
+    width:100%;
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: var(--ink);
+    font-family:'Heebo',sans-serif;
+    font-size:14px;
+  }
+  .name-input::placeholder{ color: var(--ink-dim); }
+  .name-input:disabled{ opacity:0.55; }
+  .name-row .name-input{ flex:1; }
+  .name-confirm-btn{
+    background: var(--accent);
+    color:#171414;
+    border:none;
+    border-radius:12px;
+    padding: 0 16px;
+    font-family:'Heebo',sans-serif;
+    font-weight:700;
+    font-size:13px;
+    cursor:pointer;
+    flex-shrink:0;
+  }
+  .team-card{
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 14px 10px;
+    display:flex; flex-direction:column; align-items:center; gap:8px;
+    cursor:pointer;
+    text-align:center;
+    transition: transform .12s ease, border-color .12s ease;
+  }
+  .team-card:active{transform: scale(0.96);}
+  .team-card .badge{
+    width:56px;height:56px;border-radius:50%;
+    box-shadow: inset 0 -6px 10px rgba(0,0,0,.18), 0 3px 8px rgba(0,0,0,.35);
+  }
+  .team-card .name{font-size:13px; font-weight:500; line-height:1.25;}
+
+  /* poll view */
+  .poll-summary{
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius:16px;
+    padding:16px;
+    margin-bottom:16px;
+    text-align:center;
+  }
+  .poll-summary .big{font-family:'Oswald',sans-serif; font-size:26px; font-weight:700; margin:2px 0;}
+  .poll-summary .sub{color:var(--ink-dim); font-size:13px;}
+  .bar-row{
+    display:flex; align-items:center; gap:10px;
+    margin-bottom:10px;
+  }
+  .bar-row .badge-sm{
+    width:30px;height:30px;border-radius:50%; flex-shrink:0;
+  }
+  .bar-track{
+    flex:1;
+    background: rgba(255,255,255,.06);
+    border-radius: 8px;
+    height: 26px;
+    position:relative;
+    overflow:hidden;
+    border:1px solid var(--card-border);
+  }
+  .bar-fill{
+    height:100%;
+    border-radius: 8px 0 0 8px;
+    transition: width .6s cubic-bezier(.2,.8,.2,1);
+    min-width: 3px;
+  }
+  .bar-label{
+    position:absolute; inset:0;
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 0 10px;
+    font-size:12px;
+    color: var(--ink);
+    white-space:nowrap;
+  }
+  .bar-row.me .bar-track{border-color: var(--accent);}
+  .poll-note{font-size:11.5px; color:var(--ink-dim); text-align:center; margin-top:10px; line-height:1.5;}
+
+  /* chat view */
+  .chat-messages{
+    display:flex; flex-direction:column; gap:8px;
+    max-height: 52vh;
+    overflow-y:auto;
+    padding: 4px 2px 10px;
+    margin-bottom: 10px;
+  }
+  .chat-bubble{
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 8px 12px;
+    font-size: 13.5px;
+    line-height:1.4;
+    align-self: flex-start;
+    max-width: 82%;
+    word-break: break-word;
+  }
+  .chat-bubble .t{
+    display:block;
+    font-size:10px;
+    color: var(--ink-dim);
+    margin-top:3px;
+  }
+  .chat-empty{
+    text-align:center; color:var(--ink-dim); font-size:13px; padding: 18px 0;
+  }
+  .chat-input-row{
+    display:flex; gap:8px;
+  }
+  .chat-input-row input{
+    flex:1;
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: var(--ink);
+    font-family:'Heebo',sans-serif;
+    font-size:14px;
+  }
+  .chat-input-row input::placeholder{ color: var(--ink-dim); }
+  .chat-input-row button{
+    background: var(--accent);
+    color:#171414;
+    border:none;
+    border-radius:12px;
+    padding: 0 18px;
+    font-family:'Heebo',sans-serif;
+    font-weight:700;
+    font-size:14px;
+    cursor:pointer;
+  }
+
+  /* tournament */
+  .lb-row{
+    display:flex; align-items:center; gap:10px;
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 9px 12px;
+    margin-bottom:8px;
+  }
+  .lb-row .rank{
+    font-family:'Oswald',sans-serif; font-weight:700; font-size:15px;
+    color: var(--ink-dim);
+    width:22px; text-align:center; flex-shrink:0;
+  }
+  .lb-row .badge-sm{ flex-shrink:0; }
+  .lb-row .stats{ flex:1; font-size:12.5px; color: var(--ink-dim); }
+  .lb-row .stats b{ color: var(--ink); font-size:14px; }
+  .chat-input-row-btn-reset{
+    background: transparent;
+    border:1px solid var(--card-border);
+    color: var(--ink-dim);
+    border-radius: 12px;
+    padding: 9px 18px;
+    font-family:'Heebo',sans-serif;
+    font-size:13px;
+    cursor:pointer;
+  }
+  .admin-unlock-link{
+    background:none;
+    border:none;
+    color: var(--ink-dim);
+    font-family:'Heebo',sans-serif;
+    font-size:11.5px;
+    text-decoration:underline;
+    cursor:pointer;
+    opacity:0.6;
+  }
+
+  /* game view */
+  .game-topbar{
+    display:flex; justify-content:space-between; align-items:center;
+    margin-bottom:10px;
+  }
+  .stat{
+    background: var(--card-bg);
+    border:1px solid var(--card-border);
+    border-radius:12px;
+    padding: 8px 14px;
+    text-align:center;
+    min-width: 72px;
+  }
+  .stat .n{font-family:'Oswald',sans-serif; font-size:20px; font-weight:700; line-height:1;}
+  .stat .l{font-size:10px; color:var(--ink-dim); margin-top:2px;}
+  .court-wrap{
+    position:relative;
+    border-radius:18px;
+    overflow:hidden;
+    border: 1px solid var(--card-border);
+    touch-action: none;
+  }
+  canvas{display:block; width:100%; height:auto; touch-action:none;}
+  .game-hint{
+    text-align:center; font-size:12px; color:var(--ink-dim);
+    margin-top:10px; line-height:1.5;
+  }
+  .flash-msg{
+    position:absolute; top:14%; left:50%; transform:translateX(-50%);
+    font-family:'Oswald',sans-serif; font-weight:700; font-size:26px;
+    color:#fff; text-shadow: 0 2px 10px rgba(0,0,0,.5);
+    opacity:0; pointer-events:none;
+  }
+  .flash-msg.show{ animation: pop .7s ease forwards; }
+  @keyframes pop{
+    0%{opacity:0; transform:translateX(-50%) scale(.6) translateY(10px);}
+    25%{opacity:1; transform:translateX(-50%) scale(1.08) translateY(0);}
+    70%{opacity:1;}
+    100%{opacity:0; transform:translateX(-50%) scale(1) translateY(-14px);}
+  }
+
+  /* bottom nav */
+  nav.bottom{
+    position:fixed; bottom:0; left:0; right:0;
+    background: rgba(13,20,32,.92);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--card-border);
+    display:flex;
+    padding: 8px 14px calc(8px + env(safe-area-inset-bottom));
+    gap:8px;
+    z-index: 10;
+  }
+  nav.bottom button{
+    flex:1;
+    background:transparent;
+    border:none;
+    color: var(--ink-dim);
+    font-family:'Heebo',sans-serif;
+    font-size:12px;
+    padding: 8px 4px 4px;
+    display:flex; flex-direction:column; align-items:center; gap:4px;
+    cursor:pointer;
+    border-radius:10px;
+  }
+  nav.bottom button .ic{font-size:18px;}
+  nav.bottom button.active{color: var(--accent);}
+  nav.bottom button.active .ic{transform:scale(1.1);}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="brand-ball"></div>
+      <h1>ליגת ווינר<span>מגרש הכדורסל שלך</span></h1>
+    </div>
+    <div class="header-right">
+      <button id="startTournamentBtn" class="start-tournament-btn" style="display:none;">התחל טורניר</button>
+      <div class="team-chip" id="teamChip" style="display:none;">
+        <div class="dot" id="chipDot"></div>
+        <span id="chipName"></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- VIEW: team select -->
+  <section class="view active" id="view-select">
+    <div class="lede">
+      <h2 id="selectTitle">מי הקבוצה שלך?</h2>
+      <p id="selectSub">תבחרו קבוצה — היא תהיה הקבוצה שלכם במשחק הזריקות, וגם הקול שלכם בסקר האוהדים. שימו לב: הבחירה סופית ולא ניתן להחליף קבוצה אחר כך.</p>
+    </div>
+    <div class="name-row">
+      <input id="nameInput" type="text" maxlength="24" placeholder="השם שלך (רשות) — יוצג בטורניר" autocomplete="off" class="name-input">
+      <button id="nameConfirmBtn" class="name-confirm-btn" style="display:none;">אני בפנים!</button>
+    </div>
+    <div class="team-grid" id="teamGrid"></div>
+  </section>
+
+  <!-- VIEW: poll -->
+  <section class="view" id="view-poll">
+    <div class="poll-summary">
+      <div class="sub">האוהד/ת האחרון/ה שבחר/ה</div>
+      <div class="big" id="pollMyTeam">—</div>
+      <div class="sub" id="pollTotal">אוספים קולות…</div>
+    </div>
+    <div id="pollBars"></div>
+    <div class="poll-note" id="pollNote"></div>
+  </section>
+
+  <!-- VIEW: game -->
+  <section class="view" id="view-game">
+    <div class="game-topbar">
+      <div class="stat"><div class="n" id="statScore">0</div><div class="l">קליעות</div></div>
+      <div class="stat"><div class="n" id="statAttempts">0</div><div class="l">זריקות</div></div>
+      <div class="stat"><div class="n" id="statBest">0</div><div class="l">שיא אישי</div></div>
+    </div>
+    <div class="court-wrap">
+      <canvas id="court" width="360" height="560"></canvas>
+      <div class="flash-msg" id="flashMsg">בפנים!</div>
+    </div>
+    <div class="game-hint">גררו את הכדור כלפי מעלה לכיוון הסל ושחררו כדי לזרוק 🏀</div>
+  </section>
+
+  <!-- VIEW: chat -->
+  <section class="view" id="view-chat">
+    <div class="lede">
+      <h2>מה קורה</h2>
+      <p>פינת פטפוט אנונימית לאוהדים — ההודעות לא מציגות שם או זהות של אף אחד.</p>
+    </div>
+    <div id="chatMessages" class="chat-messages"></div>
+    <div class="chat-input-row">
+      <input id="chatInput" type="text" maxlength="140" placeholder="מה קורה?…" autocomplete="off">
+      <button id="chatSend">שלח</button>
+    </div>
+    <div class="poll-note" id="chatNote"></div>
+  <!-- VIEW: tournament -->
+  <section class="view" id="view-tournament">
+    <div class="lede">
+      <h2>הטורניר</h2>
+      <p>דירוג לפי הכי הרבה קליעות, ובשוויון — הכי מעט ניסיונות.</p>
+    </div>
+    <div id="tournamentList"></div>
+    <div class="poll-note" id="tournamentNote"></div>
+    <div id="tournamentResetWrap" style="display:none; margin-top:14px; text-align:center;">
+      <button id="tournamentReset" class="chat-input-row-btn-reset">אפס טורניר לכולם</button>
+    </div>
+    <div style="margin-top:16px; text-align:center;">
+      <button id="adminUnlock" class="admin-unlock-link">מנהל? לחצו כאן</button>
+    </div>
+  </section>
+</div>
+
+<nav class="bottom">
+  <button data-view="select" class="navbtn"><span class="ic">🏀</span>קבוצה</button>
+  <button data-view="game" class="navbtn"><span class="ic">🎯</span>משחק</button>
+  <button data-view="poll" class="navbtn"><span class="ic">📊</span>סקר</button>
+  <button data-view="tournament" class="navbtn"><span class="ic">🏆</span>טורניר</button>
+  <button data-view="chat" class="navbtn"><span class="ic">💬</span>צ'אט</button>
+</nav>
+
+<script>
+(function(){
+  "use strict";
+
+  var TEAMS = [
+    {id:'hapoel_jerusalem', name:'הפועל ירושלים', color:'#171414', color2:'#e0233c'},
+    {id:'hapoel_tel_aviv',  name:'הפועל תל אביב', color:'#e0233c', color2:'#f5f3ee'},
+    {id:'maccabi_tel_aviv', name:'מכבי תל אביב',   color:'#ffd23f', color2:'#0033a0'},
+    {id:'hapoel_holon',     name:'הפועל חולון',    color:'#6a3fc7', color2:'#ffd23f'},
+    {id:'hapoel_beer_sheva',name:'הפועל באר שבע',  color:'#e0233c', color2:'#f5f3ee'},
+    {id:'bnei_herzliya',    name:'בני הרצליה',     color:'#2f6fd6', color2:'#f5f3ee'},
+    {id:'nes_ziona',        name:'עירוני נס ציונה', color:'#171414', color2:'#ff9f43'}
+  ];
+  var teamById = {};
+  TEAMS.forEach(function(t){ teamById[t.id] = t; });
+
+  var ADMIN_NAME = 'איתן בן שושן';
+  function normalizeName(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+
+  var state = {
+    myTeam: localStorage.getItem('wl_my_team') || null,
+    displayName: localStorage.getItem('wl_display_name') || '',
+    score: parseInt(localStorage.getItem('wl_score')||'0',10) || 0,
+    attempts: parseInt(localStorage.getItem('wl_attempts')||'0',10) || 0,
+    best: parseInt(localStorage.getItem('wl_best')||'0',10) || 0
+  };
+  var isNameAdmin = localStorage.getItem('wl_name_admin') === '1';
+  var nameLocked = localStorage.getItem('wl_name_locked') === '1' || !!state.myTeam;
+
+  // ---------- rendering: team grid ----------
+  var teamGrid = document.getElementById('teamGrid');
+  TEAMS.forEach(function(t){
+    var card = document.createElement('div');
+    card.className = 'team-card';
+    card.innerHTML = '<div class="badge" style="background:linear-gradient(135deg,'+t.color+' 50%,'+t.color2+' 50%)"></div><div class="name">'+t.name+'</div>';
+    card.addEventListener('click', function(){ chooseTeam(t.id); });
+    teamGrid.appendChild(card);
+  });
+
+  function updateChip(){
+    var chip = document.getElementById('teamChip');
+    if(!state.myTeam){ chip.style.display='none'; return; }
+    var t = teamById[state.myTeam];
+    document.getElementById('chipDot').style.background = t.color;
+    document.getElementById('chipName').textContent = t.name;
+    chip.style.display='flex';
+  }
+  updateChip();
+
+  function refreshSelectLock(){
+    var teamLocked = !!state.myTeam && !isOwnerViewer;
+    var nameLockedNow = nameLocked && !isOwnerViewer;
+    var grid = document.getElementById('teamGrid');
+    grid.style.pointerEvents = teamLocked ? 'none' : '';
+    grid.style.opacity = teamLocked ? '0.45' : '';
+    var nameInput = document.getElementById('nameInput');
+    nameInput.disabled = nameLockedNow;
+    if(nameLockedNow){ nameInput.value = state.displayName; }
+    var confirmBtn = document.getElementById('nameConfirmBtn');
+    confirmBtn.style.display = (!nameLockedNow && nameInput.value.trim().length>0) ? 'inline-block' : 'none';
+    var title = document.getElementById('selectTitle');
+    var sub = document.getElementById('selectSub');
+    if(teamLocked){
+      title.textContent = 'הקבוצה שלך';
+      sub.textContent = 'בחרת ב' + teamById[state.myTeam].name + '. הבחירה סופית ולא ניתן להחליף קבוצה.';
+    } else if(isOwnerViewer && state.myTeam){
+      title.textContent = 'הקבוצה שלך (בעלים)';
+      sub.textContent = 'בתור בעל הדף אתה יכול להחליף קבוצה/שם בכל זמן לצורך בדיקה — הזריקות שלך ממילא לא נספרות בטורניר.';
+    } else {
+      title.textContent = 'מי הקבוצה שלך?';
+      sub.textContent = 'תבחרו קבוצה — היא תהיה הקבוצה שלכם במשחק הזריקות, וגם הקול שלכם בסקר האוהדים. שימו לב: הבחירה סופית ולא ניתן להחליף קבוצה אחר כך.';
+    }
+  }
+  refreshSelectLock();
+
+  function lockName(){
+    if(nameLocked && !isOwnerViewer) return;
+    var input = document.getElementById('nameInput');
+    var rawName = input.value.trim().slice(0,24);
+    state.displayName = rawName;
+    localStorage.setItem('wl_display_name', rawName);
+    localStorage.setItem('wl_name_locked', '1');
+    nameLocked = true;
+    if(normalizeName(rawName) === ADMIN_NAME){
+      isNameAdmin = true;
+      localStorage.setItem('wl_name_admin', '1');
+    }
+    refreshSelectLock();
+    refreshAdminUI();
+    updateMyLeaderboardDoc();
+  }
+  document.getElementById('nameInput').addEventListener('input', function(){
+    var confirmBtn = document.getElementById('nameConfirmBtn');
+    var effLocked = nameLocked && !isOwnerViewer;
+    confirmBtn.style.display = (!effLocked && this.value.trim().length>0) ? 'inline-block' : 'none';
+  });
+  document.getElementById('nameConfirmBtn').addEventListener('click', function(){
+    lockName();
+  });
+
+  function refreshAdminUI(){
+    var isAdmin = canEdit || isOwnerViewer || isNameAdmin;
+    var wrap = document.getElementById('tournamentResetWrap');
+    wrap.style.display = isAdmin ? 'block' : 'none';
+    var unlockBtn = document.getElementById('adminUnlock');
+    if(unlockBtn){ unlockBtn.style.display = isNameAdmin ? 'none' : 'inline-block'; }
+    var headerBtn = document.getElementById('startTournamentBtn');
+    if(headerBtn){ headerBtn.style.display = isAdmin ? 'inline-block' : 'none'; }
+  }
+  refreshAdminUI();
+
+  // ---------- view switching ----------
+  var views = { select: 'view-select', poll: 'view-poll', game: 'view-game', tournament: 'view-tournament', chat: 'view-chat' };
+  function showView(key){
+    Object.keys(views).forEach(function(k){
+      document.getElementById(views[k]).classList.toggle('active', k===key);
+    });
+    document.querySelectorAll('.navbtn').forEach(function(b){
+      b.classList.toggle('active', b.dataset.view===key);
+    });
+    if(key==='game'){ resizeCanvas(); }
+  }
+  document.querySelectorAll('.navbtn').forEach(function(b){
+    b.addEventListener('click', function(){ showView(b.dataset.view); });
+  });
+
+  function chooseTeam(id){
+    if(state.myTeam && !isOwnerViewer) return; // choice is permanent for everyone except the owner
+    lockName(); // finalize the name too, if it wasn't confirmed separately already
+    state.myTeam = id;
+    localStorage.setItem('wl_my_team', id);
+    updateChip();
+    refreshSelectLock();
+    refreshAdminUI();
+    castVote(id);
+    renderPollSummary();
+    updateMyLeaderboardDoc();
+    showView('poll');
+  }
+
+  // ================= DB / POLL (Firebase) =================
+  // Paste your own Firebase project's web config here to turn on shared
+  // poll/chat/tournament across everyone who opens this page. Leave the
+  // apiKey empty to run fully local (each device sees only itself).
+  var FIREBASE_CONFIG = {
+    apiKey: "AIzaSyC3t2OikckNgLDZUHPphMfHWhKxAa1WsZY",
+    authDomain: "winner-league-26bf9.firebaseapp.com",
+    databaseURL: "https://winner-league-26bf9-default-rtdb.firebaseio.com",
+    projectId: "winner-league-26bf9"
+  };
+
+  var fdb = null;
+  var dbLive = false;
+  var voteCounts = {}; // teamId -> count
+  var chatLive = false;
+  var lbLive = false;
+  var canEdit = false;       // unused outside Claude, kept for compatibility
+  var isOwnerViewer = false; // unused outside Claude, kept for compatibility
+  var season = {id: 0, ts: 0};
+  var leaderboardEntries = [];
+
+  // a stable per-device id, since there is no sign-in here
+  var myId = localStorage.getItem('wl_device_id');
+  if(!myId){
+    myId = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2,10);
+    localStorage.setItem('wl_device_id', myId);
+  }
+
+  function initCapabilities(){
+    if(!FIREBASE_CONFIG.apiKey){
+      dbLive = false;
+      voteCounts = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
+      renderPollBars(); renderPollSummary();
+      renderChat(null);
+      renderTournament();
+      refreshAdminUI();
+      return;
+    }
+    try{
+      firebase.initializeApp(FIREBASE_CONFIG);
+      fdb = firebase.database();
+      dbLive = true;
+    }catch(e){ dbLive = false; }
+
+    if(!dbLive){
+      voteCounts = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
+      renderPollBars(); renderPollSummary();
+      renderChat(null);
+      renderTournament();
+      refreshAdminUI();
+      return;
+    }
+
+    // votes / poll — everyone reads and writes only their own device id
+    fdb.ref('votes').on('value', function(snap){
+      var counts = {};
+      snap.forEach(function(child){
+        var v = child.val();
+        if(v && v.team){ counts[v.team] = (counts[v.team]||0)+1; }
+      });
+      voteCounts = counts;
+      renderPollBars();
+      renderPollSummary();
+    }, function(){ /* degrade quietly */ });
+    if(state.myTeam){ castVote(state.myTeam, true); }
+
+    // anonymous chat
+    fdb.ref('chat').orderByChild('ts').limitToLast(50).on('value', function(snap){
+      chatLive = true;
+      var msgs = [];
+      snap.forEach(function(child){ msgs.push(child.val()); });
+      renderChat(msgs);
+    }, function(){ chatLive = false; renderChat(null); });
+
+    // tournament season marker
+    fdb.ref('meta/season').on('value', function(snap){
+      var data = snap.val();
+      applySeason(data && data.id ? {id:data.id, ts:data.ts||0} : {id:0, ts:0});
+    }, function(){ /* keep season 0 */ });
+
+    // leaderboard
+    fdb.ref('leaderboard').on('value', function(snap){
+      lbLive = true;
+      var entries = [];
+      snap.forEach(function(child){ entries.push(child.val()); });
+      leaderboardEntries = entries;
+      renderTournament();
+    }, function(){ lbLive = false; renderTournament(); });
+
+    refreshAdminUI();
+  }
+
+  function applySeason(newSeason){
+    var seenId = localStorage.getItem('wl_season_seen');
+    var newId = String(newSeason.id);
+    if(seenId !== newId){
+      state.score = 0; state.attempts = 0;
+      localStorage.setItem('wl_score','0');
+      localStorage.setItem('wl_attempts','0');
+      updateStats();
+    }
+    localStorage.setItem('wl_season_seen', newId);
+    season = newSeason;
+    updateMyLeaderboardDoc();
+    renderTournament();
+  }
+
+  function updateMyLeaderboardDoc(){
+    if(dbLive && myId && state.myTeam){
+      fdb.ref('leaderboard/'+myId).set({
+        team: state.myTeam,
+        name: state.displayName || '',
+        made: state.score,
+        attempts: state.attempts,
+        seasonId: season.id,
+        owner: isNameAdmin,
+        ts: Date.now()
+      }).catch(function(){});
+    }
+  }
+
+  function renderTournament(){
+    var box = document.getElementById('tournamentList');
+    var note = document.getElementById('tournamentNote');
+    if(!lbLive){
+      box.innerHTML = '<div class="chat-empty">הטורניר המשותף לא זמין כרגע בדפדפן הזה.</div>';
+      note.textContent = '';
+      return;
+    }
+    var rows = leaderboardEntries.filter(function(e){ return e && !e.owner && e.seasonId===season.id; });
+    rows.sort(function(a,b){
+      if(b.made !== a.made) return b.made - a.made;
+      return a.attempts - b.attempts;
+    });
+    box.innerHTML = '';
+    if(rows.length===0){
+      box.innerHTML = '<div class="chat-empty">אף אחד עדיין לא נרשם לטורניר הנוכחי — בוחרים קבוצה ושם כדי להירשם 🏀</div>';
+    } else {
+      rows.forEach(function(e, i){
+        var t = teamById[e.team];
+        var row = document.createElement('div');
+        row.className = 'lb-row';
+        var pct = e.attempts>0 ? Math.round((e.made/e.attempts)*100) : 0;
+        var who = e.name ? e.name : 'אוהד ללא שם';
+        var statsText = e.attempts>0
+          ? (e.made+' קליעות מתוך '+e.attempts+' ניסיונות · '+pct+'%')
+          : 'רשום/ה לטורניר — עוד לא זרק/ה';
+        var row2 =
+          '<div class="rank">'+(i+1)+'</div>' +
+          '<div class="badge-sm" style="background:linear-gradient(135deg,'+(t?t.color:'#666')+' 50%,'+(t?t.color2:'#666')+' 50%)"></div>' +
+          '<div class="stats"><b></b> · '+statsText+'</div>';
+        row.innerHTML = row2;
+        row.querySelector('.stats b').textContent = who;
+        box.appendChild(row);
+      });
+    }
+    var progress = rows.length < MIN_REGISTRANTS
+      ? (' עוד '+(MIN_REGISTRANTS-rows.length)+' כדי שיהיה אפשר להתחיל טורניר (מינימום '+MIN_REGISTRANTS+').')
+      : '';
+    note.textContent = rows.length + (rows.length===1 ? ' נרשם/ה לטורניר הנוכחי. ' : ' נרשמו לטורניר הנוכחי. ') + 'הדירוג משותף לכל מי שפותח את הדף.' + progress;
+  }
+
+  var MIN_REGISTRANTS = 6;
+  function currentRegistrantCount(){
+    return leaderboardEntries.filter(function(e){ return e && !e.owner && e.seasonId===season.id; }).length;
+  }
+
+  function startNewTournament(btn, andShowView){
+    if(!dbLive){
+      var prevText = btn.textContent;
+      btn.textContent = 'אין חיבור לשרת';
+      setTimeout(function(){ btn.textContent = prevText; }, 1800);
+      return;
+    }
+    if(!isNameAdmin){
+      var prevText2 = btn.textContent;
+      btn.textContent = 'אין הרשאה';
+      setTimeout(function(){ btn.textContent = prevText2; }, 1800);
+      return;
+    }
+    var count = currentRegistrantCount();
+    if(count < MIN_REGISTRANTS){
+      var prevText3 = btn.textContent;
+      btn.textContent = 'צריך '+MIN_REGISTRANTS+' רשומים (יש '+count+')';
+      if(andShowView){ showView('tournament'); }
+      setTimeout(function(){ btn.textContent = prevText3; }, 2400);
+      return;
+    }
+    var original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'מתחיל…';
+    // "key" must match the Realtime Database rule so a random visitor
+    // can't call this from the browser console without the admin name
+    fdb.ref('meta/season').set({id: Date.now(), ts: Date.now(), key: ADMIN_NAME}).then(function(){
+      btn.textContent = 'טורניר חדש התחיל! 🏆';
+      if(andShowView){ showView('tournament'); }
+    }).catch(function(){
+      btn.textContent = 'משהו נכשל, נסו שוב';
+    }).finally(function(){
+      setTimeout(function(){ btn.disabled = false; btn.textContent = original; }, 2200);
+    });
+  }
+
+  document.getElementById('adminUnlock').addEventListener('click', function(){
+    var entered = window.prompt('קוד מנהל:');
+    if(entered === null) return;
+    if(normalizeName(entered) === ADMIN_NAME){
+      isNameAdmin = true;
+      localStorage.setItem('wl_name_admin', '1');
+      refreshAdminUI();
+      updateMyLeaderboardDoc();
+      this.textContent = 'זוהית כמנהל ✓';
+    } else {
+      var self = this;
+      this.textContent = 'קוד שגוי';
+      setTimeout(function(){ self.textContent = 'מנהל? לחצו כאן'; }, 1500);
+    }
+  });
+
+  document.getElementById('tournamentReset').addEventListener('click', function(){
+    startNewTournament(document.getElementById('tournamentReset'), false);
+  });
+
+  document.getElementById('startTournamentBtn').addEventListener('click', function(){
+    startNewTournament(document.getElementById('startTournamentBtn'), true);
+  });
+
+  function castVote(teamId, silent){
+    if(dbLive && myId){
+      fdb.ref('votes/'+myId).set({team: teamId, ts: Date.now()}).catch(function(){});
+    } else {
+      var local = JSON.parse(localStorage.getItem('wl_local_votes')||'{}');
+      var prev = localStorage.getItem('wl_local_prev_vote');
+      if(prev && local[prev]){ local[prev] = Math.max(0, local[prev]-1); }
+      local[teamId] = (local[teamId]||0)+1;
+      localStorage.setItem('wl_local_votes', JSON.stringify(local));
+      localStorage.setItem('wl_local_prev_vote', teamId);
+      voteCounts = local;
+      renderPollBars();
+    }
+    if(!silent){ renderPollSummary(); }
+  }
+
+  function renderPollBars(){
+    var box = document.getElementById('pollBars');
+    var entries = TEAMS.map(function(t){ return {t:t, n: voteCounts[t.id]||0}; });
+    var total = entries.reduce(function(s,e){return s+e.n;},0);
+    entries.sort(function(a,b){ return b.n - a.n; });
+    box.innerHTML = '';
+    entries.forEach(function(e){
+      var pct = total>0 ? Math.round((e.n/total)*100) : 0;
+      var row = document.createElement('div');
+      row.className = 'bar-row' + (state.myTeam===e.t.id ? ' me' : '');
+      row.innerHTML =
+        '<div class="badge-sm" style="background:linear-gradient(135deg,'+e.t.color+' 50%,'+e.t.color2+' 50%)"></div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%;background:'+e.t.color+'55;border-right:3px solid '+e.t.color+';"></div>' +
+          '<div class="bar-label"><span>'+e.t.name+'</span><span>'+e.n+' · '+pct+'%</span></div>' +
+        '</div>';
+      box.appendChild(row);
+    });
+    var totalEl = document.getElementById('pollTotal');
+    if(total===0){ totalEl.textContent = 'עדיין אין קולות — היו הראשונים'; }
+    else { totalEl.textContent = total===1 ? 'קול אחד נספר עד כה' : total+' קולות נספרו עד כה'; }
+
+    var note = document.getElementById('pollNote');
+    note.textContent = dbLive
+      ? 'התוצאות מתעדכנות בזמן אמת לכל מי שפותח את הדף.'
+      : 'התוצאות נשמרות במכשיר הזה בלבד כרגע.';
+  }
+
+  function renderPollSummary(){
+    var el = document.getElementById('pollMyTeam');
+    if(state.myTeam){
+      var t = teamById[state.myTeam];
+      el.textContent = t.name;
+      el.style.color = t.color;
+    } else {
+      el.textContent = '—';
+    }
+  }
+
+  // ---------- anonymous chat ----------
+  function relTime(ts){
+    if(!ts) return '';
+    var diff = Math.max(0, Date.now()-ts);
+    var m = Math.floor(diff/60000);
+    if(m<1) return 'עכשיו';
+    if(m<60) return 'לפני '+m+' דק׳';
+    var h = Math.floor(m/60);
+    if(h<24) return 'לפני '+h+' שע׳';
+    return 'לפני '+Math.floor(h/24)+' ימים';
+  }
+
+  function renderChat(msgs){
+    var box = document.getElementById('chatMessages');
+    var note = document.getElementById('chatNote');
+    if(msgs===null){
+      box.innerHTML = '<div class="chat-empty">הצ׳אט המשותף לא זמין כרגע בדפדפן הזה.</div>';
+      note.textContent = '';
+      return;
+    }
+    box.innerHTML = '';
+    if(msgs.length===0){
+      box.innerHTML = '<div class="chat-empty">אין עדיין הודעות — תהיו הראשונים להגיד שלום 👋</div>';
+    } else {
+      msgs.forEach(function(m){
+        var b = document.createElement('div');
+        b.className = 'chat-bubble';
+        var textSpan = document.createElement('span');
+        textSpan.textContent = (m && m.text) ? m.text : '';
+        var timeSpan = document.createElement('span');
+        timeSpan.className = 't';
+        timeSpan.textContent = relTime(m && m.ts);
+        b.appendChild(textSpan);
+        b.appendChild(timeSpan);
+        box.appendChild(b);
+      });
+      box.scrollTop = box.scrollHeight;
+    }
+    note.textContent = chatLive
+      ? 'ההודעות אנונימיות ומשותפות לכל מי שפותח את הדף — בלי שם, בלי זהות.'
+      : '';
+  }
+
+  function sendChatMessage(){
+    var input = document.getElementById('chatInput');
+    var text = input.value.trim();
+    if(!text) return;
+    input.value = '';
+    if(dbLive){
+      fdb.ref('chat').push({text:text, ts:Date.now()}).catch(function(){});
+    }
+  }
+  document.getElementById('chatSend').addEventListener('click', sendChatMessage);
+  document.getElementById('chatInput').addEventListener('keydown', function(e){
+    if(e.key==='Enter'){ e.preventDefault(); sendChatMessage(); }
+  });
+
+  initCapabilities();
 
   // ================= GAME =================
   var canvas = document.getElementById('court');
